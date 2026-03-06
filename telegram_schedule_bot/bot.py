@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+from typing import Optional
 
 import pytz
 import uvicorn
@@ -83,7 +85,24 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- GITHUB WEBHOOK ----------
 
 async def send_notification(message: str):
-    await telegram_app.bot.send_message(chat_id=GROUP_ID, text=message, disable_web_page_preview=True)
+    await telegram_app.bot.send_message(
+        chat_id=GROUP_ID,
+        text=message,
+        parse_mode="MarkdownV2",
+        disable_web_page_preview=True,
+    )
+
+
+def escape_markdown_v2(text: str) -> str:
+    if text is None:
+        return ""
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", str(text))
+
+
+def escape_markdown_v2_url(url: str) -> str:
+    if not url:
+        return ""
+    return str(url).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 def verify_github_signature(body: bytes, signature_header: str) -> bool:
@@ -105,62 +124,54 @@ def format_push_message(payload: dict) -> str:
     ref = payload.get("ref", "")
     branch = ref.split("/")[-1] if ref else "unknown"
     pusher = payload.get("pusher", {}).get("name", "unknown")
-    commits = payload.get("commits", [])[:5]
+    commit = payload.get("head_commit") or (payload.get("commits", [{}])[-1] if payload.get("commits") else {})
+    commit_message = commit.get("message", "(no message)").split("\n", 1)[0]
+    short_sha = commit.get("id", "")[:7] or "unknown"
 
     lines = [
-        "GitHub Push",
-        f"Repo: {repo_name}",
-        f"Branch: {branch}",
-        f"Pusher: {pusher}",
+        f"🚀 New Push — {escape_markdown_v2(repo_name)}",
+        f"├ Branch: {escape_markdown_v2(branch)}",
+        f"├ By: {escape_markdown_v2(pusher)}",
+        f"└ {escape_markdown_v2(short_sha)}: {escape_markdown_v2(commit_message)}",
     ]
-
-    if commits:
-        lines.append("Commits:")
-        for commit in commits:
-            message = commit.get("message", "(no message)").split("\n", 1)[0]
-            short_sha = commit.get("id", "")[:7]
-            lines.append(f"- {short_sha}: {message}")
-    else:
-        lines.append("Commits: none")
 
     return "\n".join(lines)
 
 
-def format_workflow_message(payload: dict) -> str:
+def format_workflow_message(payload: dict) -> Optional[str]:
     workflow_run = payload.get("workflow_run", {})
     repo_name = payload.get("repository", {}).get("full_name", "unknown")
     workflow_name = workflow_run.get("name", "unknown")
     run_url = workflow_run.get("html_url", "")
 
     status = workflow_run.get("status", "")
-    conclusion = workflow_run.get("conclusion", "")
+    conclusion = workflow_run.get("conclusion")
 
-    if status == "completed":
-        if conclusion == "success":
-            normalized_status = "success"
-        elif conclusion in {
-            "failure",
-            "cancelled",
-            "timed_out",
-            "startup_failure",
-            "stale",
-            "action_required",
-        }:
-            normalized_status = "failure"
-        else:
-            normalized_status = conclusion or "failure"
+    # Ignore non-completed updates and completed events without a conclusion.
+    if status != "completed" or conclusion is None:
+        return None
+
+    if conclusion == "success":
+        headline = f"✅ Deploy complete — {escape_markdown_v2(repo_name)}"
+    elif conclusion == "failure":
+        headline = f"❌ Deploy failed — {escape_markdown_v2(repo_name)}"
+    elif conclusion == "cancelled":
+        headline = f"🚫 Deploy cancelled — {escape_markdown_v2(repo_name)}"
     else:
-        normalized_status = "in_progress"
+        return None
 
-    return "\n".join(
-        [
-            "GitHub Workflow",
-            f"Repo: {repo_name}",
-            f"Workflow: {workflow_name}",
-            f"Status: {normalized_status}",
-            f"Run: {run_url}",
-        ]
-    )
+    escaped_url = escape_markdown_v2_url(run_url)
+    lines = [
+        headline,
+        f"├ Workflow: {escape_markdown_v2(workflow_name)}",
+    ]
+
+    if escaped_url:
+        lines.append(f"└ 🔗 [View Run]({escaped_url})")
+    else:
+        lines.append("└ 🔗 View Run")
+
+    return "\n".join(lines)
 
 
 web_app = FastAPI()
@@ -184,7 +195,9 @@ async def github_webhook(request: Request):
     if event == "push":
         await send_notification(format_push_message(payload))
     elif event == "workflow_run":
-        await send_notification(format_workflow_message(payload))
+        message = format_workflow_message(payload)
+        if message:
+            await send_notification(message)
 
     return {"ok": True}
 
