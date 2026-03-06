@@ -121,18 +121,14 @@ def verify_github_signature(body: bytes, signature_header: str) -> bool:
 
 def format_push_message(payload: dict) -> str:
     repo_name = payload.get("repository", {}).get("full_name", "unknown")
-    ref = payload.get("ref", "")
-    branch = ref.split("/")[-1] if ref else "unknown"
     pusher = payload.get("pusher", {}).get("name", "unknown")
     commit = payload.get("head_commit") or (payload.get("commits", [{}])[-1] if payload.get("commits") else {})
     commit_message = commit.get("message", "(no message)").split("\n", 1)[0]
-    short_sha = commit.get("id", "")[:7] or "unknown"
 
     lines = [
-        f"🚀 New Push — {escape_markdown_v2(repo_name)}",
-        f"├ Branch: {escape_markdown_v2(branch)}",
-        f"├ By: {escape_markdown_v2(pusher)}",
-        f"└ {escape_markdown_v2(short_sha)}: {escape_markdown_v2(commit_message)}",
+        f"🚀 {escape_markdown_v2(repo_name)}",
+        f"👤 {escape_markdown_v2(pusher)}",
+        f"📝 {escape_markdown_v2(commit_message)}",
     ]
 
     return "\n".join(lines)
@@ -141,8 +137,6 @@ def format_push_message(payload: dict) -> str:
 def format_workflow_message(payload: dict) -> Optional[str]:
     workflow_run = payload.get("workflow_run", {})
     repo_name = payload.get("repository", {}).get("full_name", "unknown")
-    workflow_name = workflow_run.get("name", "unknown")
-    run_url = workflow_run.get("html_url", "")
 
     status = workflow_run.get("status", "")
     conclusion = workflow_run.get("conclusion")
@@ -152,26 +146,13 @@ def format_workflow_message(payload: dict) -> Optional[str]:
         return None
 
     if conclusion == "success":
-        headline = f"✅ Deploy complete — {escape_markdown_v2(repo_name)}"
-    elif conclusion == "failure":
-        headline = f"❌ Deploy failed — {escape_markdown_v2(repo_name)}"
-    elif conclusion == "cancelled":
-        headline = f"🚫 Deploy cancelled — {escape_markdown_v2(repo_name)}"
-    else:
-        return None
+        return f"✅ {escape_markdown_v2(repo_name)} — Deploy complete"
+    if conclusion == "failure":
+        return f"❌ {escape_markdown_v2(repo_name)} — Deploy failed"
+    if conclusion == "cancelled":
+        return f"🚫 {escape_markdown_v2(repo_name)} — Deploy cancelled"
 
-    escaped_url = escape_markdown_v2_url(run_url)
-    lines = [
-        headline,
-        f"├ Workflow: {escape_markdown_v2(workflow_name)}",
-    ]
-
-    if escaped_url:
-        lines.append(f"└ 🔗 [View Run]({escaped_url})")
-    else:
-        lines.append("└ 🔗 View Run")
-
-    return "\n".join(lines)
+    return None
 
 
 web_app = FastAPI()
