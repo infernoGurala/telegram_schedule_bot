@@ -1,13 +1,23 @@
+from datetime import datetime, timedelta, time
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+
+import pytz
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from datetime import datetime, timedelta, time
-import pytz
 
 from message_builder import build_message_for_date
 from timetable import TIMETABLE
 
 TOKEN = "8388895720:AAFczzuwqyDCcz2-SjAF_6wJQFq0pA-rWJw"
 GROUP_ID = -5107345082
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "8080"))
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -55,7 +65,7 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📅 Weekly Schedule\n\n"
 
-    for day in ["MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY"]:
+    for day in ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]:
         text += f"{day}\n"
         for s, t in TIMETABLE[day]["morning"]:
             text += f"• {s} – {t}\n"
@@ -70,25 +80,154 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(str(update.effective_chat.id))
 
 
+# ---------- GITHUB WEBHOOK ----------
+
+async def send_notification(message: str):
+    await telegram_app.bot.send_message(chat_id=GROUP_ID, text=message, disable_web_page_preview=True)
+
+
+def verify_github_signature(body: bytes, signature_header: str) -> bool:
+    if not GITHUB_WEBHOOK_SECRET:
+        return False
+    if not signature_header.startswith("sha256="):
+        return False
+
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
+def format_push_message(payload: dict) -> str:
+    repo_name = payload.get("repository", {}).get("full_name", "unknown")
+    ref = payload.get("ref", "")
+    branch = ref.split("/")[-1] if ref else "unknown"
+    pusher = payload.get("pusher", {}).get("name", "unknown")
+    commits = payload.get("commits", [])[:5]
+
+    lines = [
+        "GitHub Push",
+        f"Repo: {repo_name}",
+        f"Branch: {branch}",
+        f"Pusher: {pusher}",
+    ]
+
+    if commits:
+        lines.append("Commits:")
+        for commit in commits:
+            message = commit.get("message", "(no message)").split("\n", 1)[0]
+            short_sha = commit.get("id", "")[:7]
+            lines.append(f"- {short_sha}: {message}")
+    else:
+        lines.append("Commits: none")
+
+    return "\n".join(lines)
+
+
+def format_workflow_message(payload: dict) -> str:
+    workflow_run = payload.get("workflow_run", {})
+    repo_name = payload.get("repository", {}).get("full_name", "unknown")
+    workflow_name = workflow_run.get("name", "unknown")
+    run_url = workflow_run.get("html_url", "")
+
+    status = workflow_run.get("status", "")
+    conclusion = workflow_run.get("conclusion", "")
+
+    if status == "completed":
+        if conclusion == "success":
+            normalized_status = "success"
+        elif conclusion in {
+            "failure",
+            "cancelled",
+            "timed_out",
+            "startup_failure",
+            "stale",
+            "action_required",
+        }:
+            normalized_status = "failure"
+        else:
+            normalized_status = conclusion or "failure"
+    else:
+        normalized_status = "in_progress"
+
+    return "\n".join(
+        [
+            "GitHub Workflow",
+            f"Repo: {repo_name}",
+            f"Workflow: {workflow_name}",
+            f"Status: {normalized_status}",
+            f"Run: {run_url}",
+        ]
+    )
+
+
+web_app = FastAPI()
+
+
+@web_app.post("/github-webhook")
+async def github_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+
+    if not verify_github_signature(body, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = request.headers.get("X-GitHub-Event", "")
+
+    if event == "push":
+        await send_notification(format_push_message(payload))
+    elif event == "workflow_run":
+        await send_notification(format_workflow_message(payload))
+
+    return {"ok": True}
+
+
 # ---------- APP ----------
 
-app = ApplicationBuilder().token(TOKEN).build()
+telegram_app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("today", today))
-app.add_handler(CommandHandler("tomorrow", tomorrow))
-app.add_handler(CommandHandler("week", week))
-app.add_handler(CommandHandler("id", get_id))
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("today", today))
+telegram_app.add_handler(CommandHandler("tomorrow", tomorrow))
+telegram_app.add_handler(CommandHandler("week", week))
+telegram_app.add_handler(CommandHandler("id", get_id))
 
 
 # ---------- DAILY 5 AM IST MON–FRI ----------
 
-app.job_queue.run_daily(
+telegram_app.job_queue.run_daily(
     send_daily,
     time=time(5, 0, tzinfo=IST),
-    days=(0,1,2,3,4)
+    days=(0, 1, 2, 3, 4),
 )
 
 
-print("🤖 Bot running...")
-app.run_polling()
+async def main():
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+
+    print("🤖 Bot polling started")
+    print(f"🌐 Webhook server listening on 0.0.0.0:{PORT}")
+
+    server = uvicorn.Server(
+        uvicorn.Config(web_app, host="0.0.0.0", port=PORT, log_level="info")
+    )
+
+    try:
+        await server.serve()
+    finally:
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
