@@ -120,15 +120,14 @@ def verify_github_signature(body: bytes, signature_header: str) -> bool:
 
 
 def format_push_message(payload: dict) -> str:
-    repo_name = payload.get("repository", {}).get("full_name", "unknown")
     pusher = payload.get("pusher", {}).get("name", "unknown")
     commit = payload.get("head_commit") or (payload.get("commits", [{}])[-1] if payload.get("commits") else {})
     commit_message = commit.get("message", "(no message)").split("\n", 1)[0]
 
     lines = [
-        f"🚀 {escape_markdown_v2(repo_name)}",
-        f"👤 {escape_markdown_v2(pusher)}",
-        f"📝 {escape_markdown_v2(commit_message)}",
+        "New push 🚀",
+        f"👤 *{escape_markdown_v2(pusher)}*",
+        escape_markdown_v2(commit_message),
     ]
 
     return "\n".join(lines)
@@ -136,7 +135,6 @@ def format_push_message(payload: dict) -> str:
 
 def format_workflow_message(payload: dict) -> Optional[str]:
     workflow_run = payload.get("workflow_run", {})
-    repo_name = payload.get("repository", {}).get("full_name", "unknown")
 
     status = workflow_run.get("status", "")
     conclusion = workflow_run.get("conclusion")
@@ -146,11 +144,11 @@ def format_workflow_message(payload: dict) -> Optional[str]:
         return None
 
     if conclusion == "success":
-        return f"✅ {escape_markdown_v2(repo_name)} — Deploy complete"
+        return "✅ Deploy complete"
     if conclusion == "failure":
-        return f"❌ {escape_markdown_v2(repo_name)} — Deploy failed"
+        return "❌ Deploy failed"
     if conclusion == "cancelled":
-        return f"🚫 {escape_markdown_v2(repo_name)} — Deploy cancelled"
+        return "🚫 Deploy cancelled"
 
     return None
 
